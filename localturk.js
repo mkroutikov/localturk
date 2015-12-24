@@ -7,7 +7,6 @@
 
 var assert = require('assert'),
     csv = require('csv'),
-    csvParse = require('csv-parse'),
     fs = require('fs'),
     http = require('http'),
     express = require('express'),
@@ -23,6 +22,7 @@ program
   .usage('[options] template.html tasks.csv outputs.csv')
   .option('-s, --static_dir <dir>', 'Serve static content from this directory')
   .option('-p, --port <n>', 'Run on this port (default 4321)', parseInt)
+  .option('-b, --batch_size <n>', 'Batch <n> records per page (default 1)', parseInt)
   .option('-q, --quit_on_done', 'Quit when done with all tasks.')
   .parse(process.argv);
 
@@ -36,73 +36,134 @@ var template_file = args[0],
     outputs_file = args[2];
 
 var port = program.port || 4321,
-    static_dir = program.static_dir || null;
+    static_dir = program.static_dir || null,
+    batch_size = program.batch_size || 1;
 
-// Task is a dictionary. completed_tasks is a list of dictionaries,
-// each containing a superset of the keys in the input task.  Returns true if
-// there's a completed task which has all the key/value pairs in |task|.
-function isTaskCompleted(task, completed_tasks) {
-  for (var i = 0; i < completed_tasks.length; i++) {
-    var d = completed_tasks[i];
-    var match = true;
-    for (var k in task) {
-      var dnorm = d[k].replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-      var tasknorm = task[k].replace(/\r/g, '\n');
-      if (!(k in d) || dnorm != tasknorm) {
-        match = false;
-        break;
-      }
-    }
+function readCsvFile(filename, cb) {
+	var parser = csv.parse({columns: true, skip_empty_lines: true});
+	var records = [];
+	
+	parser.on('readable', function() {
+		var record;
+		
+		while (record = parser.read()) {
+			records.push(record);
+		}
+	}).on('error', function(err) {
+		cb(arr);
+	}).on('finish', function() {
+		if (parser.options.columns === true) {
+			// zero-length file, no columns!
+			cb(null, []);
+		} else {
+			console.log('read', records.length, 'records');
+			cb(null, records, parser.options.columns);
+		}
+	});
+	
+	console.log('Reading ' + filename);
 
-    if (match) return true;
-  }
-  return false;
+	fs.createReadStream(filename).pipe(parser);
 }
 
-// Find an object containing k/v pairs for the next task.
-// Fires either task_cb(kv_pairs_for_task) or done_cb() if there are no tasks
-// remaining.
-function getNextTask(task_cb, done_cb) {
-  var completed_tasks = [];
-  var cb_fired = false;
-  var parser = makeParser();
-  var finished_count = 0;
-  parser
-    .on('readable', function() {
-      var record;
-      while (record = parser.read()) {
-        // XXX old code skipped the first row
-        completed_tasks.push(record);
-        finished_count++;
-      }
-    })
-    .on('finish', function() {
-      var task = null;
-      // Now read the inputs until we find one which hasn't been completed.
-      var parser = makeParser();
-      var total_count = 0;
-      parser
-        .on('readable', function() {
-          var record;
-          while (record = parser.read()) {
-            total_count++;
-            if (!task && !isTaskCompleted(record, completed_tasks)) {
-              task = record;
-            }
-          }
-        })
-        .on('finish', function() {
-          if (task) {
-            task_cb(task, finished_count, total_count);
-          } else {
-            done_cb();
-          }
-        });
+function writeCsvFile(filename, records, columns, append, cb) {
+	var stringifier = csv.stringify({columns: columns, header: !append});
+	
+	stringifier.on('error', function(err) {
+		cb(err);
+	}).on('end', function() {
+		cb();
+	});
+	
+	stringifier.pipe(fs.createWriteStream(filename, {flags: append ? 'a' : 'w'}));
+	
+	records.forEach(function(record) {
+		stringifier.write(record);
+	});
+	
+	stringifier.end();
+}
 
-      fs.createReadStream(tasks_file).pipe(parser);
-    });
+function appendableCsvFile(filename, cb) {
+	if (!fs.existsSync(filename)) {
+		fs.writeFileSync(filename, '');
+	}
+	
+	readCsvFile(filename, function(err, records, columns) {
+		if (err) return cb(err);
 
-  fs.createReadStream(outputs_file).pipe(parser);
+		columns = columns || [];
+
+		var csvFile = { records: records, columns: columns};
+		
+		var columnSet = {};
+		columns.forEach(function(col) {
+			columnSet[col] = true;
+		});
+		
+		csvFile.append = function(newRecords, callback) {
+			var needRebuild = false;
+			
+			newRecords.forEach(function(record) {
+				for (var col in record) {
+					if (!columnSet[col]) {
+						needRebuild = true;
+						columns.push(col);
+						columnSet[col] = true;
+					}
+				}
+			});
+			
+			newRecords.forEach(function(record) {
+				records.push(record);
+			});
+			
+			if(needRebuild) {
+				writeCsvFile(filename, records, columns, false, callback);
+			} else {
+				writeCsvFile(filename, newRecords, columns, true, callback);
+			}
+		}
+		
+		cb(null, csvFile);
+	});
+}
+
+function createWorkflow(taskFilename, outputFilename, cb) {
+	readCsvFile(taskFilename, function(err, tasks, columns) {
+		if (err) return cb(arr);
+		
+		appendableCsvFile(outputFilename, function(err, csvFile) {
+			if (err) return cb(err);
+			
+			var tasksTodo = tasks;
+			var tasksDone = csvFile.records;
+			
+			var workflow = {
+					tasks: tasks,
+					finished: csvFile.records
+			};
+			workflow.hasMore = function() {
+				return tasksDone.length < tasksTodo.length;
+			};
+			
+			workflow.nextBatch = function(batchSize) {
+				batchSize = batchSize || 1;
+				if (tasksTodo.length - tasksDone.length < batchSize) {
+					batchSize = tasksTodo.length - tasksDone.length; 
+				}
+				if (batchSize <= 0) {
+					return [];
+				}
+				
+				return tasksTodo.slice(tasksDone.length, tasksDone.length + batchSize);
+			}
+			
+			workflow.writeCompletedBatch = csvFile.append;
+			
+			cb(null, workflow);
+		});
+	});
 }
 
 function htmlEntities(str) {
@@ -113,180 +174,171 @@ function htmlEntities(str) {
         .replace(/"/g, '&quot;');
 }
 
-// Hacked out of node CSV module, because its API is incomprehensible.
-function quoteLine(line) {
-  var csv = {
-    writeOptions: {
-      delimiter: ',',
-      quote: '"',
-      escape: '"'
-    }
-  };
-  if(line instanceof Array){
-    var newLine = '';
-    for(var i=0; i<line.length; i++){
-      var field = line[i];
-      if(typeof field === 'string'){
-        // fine 99% of the cases, keep going
-      }else if(typeof field === 'number'){
-        // Cast number to string
-        field = '' + field;
-      }else if(typeof field === 'boolean'){
-        // Cast boolean to string
-        field = field ? '1' : '';
-      }else if(field instanceof Date){
-        // Cast date to timestamp string
-        field = '' + field.getTime();
-      }
-      if(field){
-        var containsdelimiter = field.indexOf(csv.writeOptions.delimiter || csv.readOptions.delimiter) >= 0;
-        var containsQuote = field.indexOf(csv.writeOptions.quote || csv.readOptions.quote) >= 0;
-        var containsLinebreak = field.indexOf("\r") >= 0 || field.indexOf("\n") >= 0;
-        if(containsQuote){
-          field = field.replace(
-              new RegExp(csv.writeOptions.quote || csv.readOptions.quote,'g')
-              , (csv.writeOptions.escape || csv.readOptions.escape)
-              + (csv.writeOptions.quote || csv.readOptions.quote));
-        }
+function parseTemplate(filename) {
+	var data = fs.readFileSync(filename).toString('utf-8');
+	
+	var parts = data.split(/<!--\s*localturk-repeat\s*-->/ig);
+	var head = '', tail = '', repeat = data;
+	
+	if (parts.length === 1) {
+	} else if (parts.length !== 3) {
+		throw Exception('failed to parse localturk repeat markers - too many or too few of them?');
+	} else {
+		head = parts[0];
+		repeat = parts[1];
+		tail = parts[2];
+	}
+	
+	// lets inject ${index} into any named <input> elements in the repeat block
+	var re = /<input\s+([^>]+)\/?>/g;
+	var out = [];
+	var offset = 0;
+	
+	while (true) {
+			var result = re.exec(repeat);
+			if (!result) break;
 
-        if(containsQuote || containsdelimiter || containsLinebreak || csv.writeOptions.quoted){
-          field = (csv.writeOptions.quote || csv.readOptions.quote) + field + (csv.writeOptions.quote || csv.readOptions.quote);
-        }
-        newLine += field;
-      }
-      if(i!==line.length-1){
-        newLine += csv.writeOptions.delimiter || csv.readOptions.delimiter;
-      }
-    }
-  }
-  return newLine;
+			re.index = result.index;
+
+			var inp = result[0];
+
+			out.push(repeat.slice(offset, result.index));
+			offset = result.index + inp.length;
+			
+			var match = /name="([^"]+)"/.exec(inp);
+			if (match) {
+				out.push(inp.slice(0, match.index));
+				out.push('name="' + match[1] + '__${index}' + '"');
+				out.push(inp.slice(match.index + match[0].length));
+			} else {
+				out.push(inp);
+			}
+	}
+	
+	out.push(repeat.slice(offset));
+	
+	repeat = out.join('');
+	
+	return {
+		head: head,
+		repeat: repeat,
+		tail: tail
+	};
 }
+
+var template = parseTemplate(template_file);
 
 // Reads the template file and instantiates it with the task dictionary.
 // Fires ready_cb(null, instantiated template) on success, or with an error.
-function renderTemplate(template_file, task, ready_cb) {
-  fs.readFile(template_file, function(err, data) {
-    if (err) {
-      ready_cb(err);
-      return;
-    }
+function renderTasks(template, tasks) {
+	var out = [template.head];
+	
+	for (var index = 0; index < tasks.length; index++) {
+	    var t = template.repeat;
+	    var task = tasks[index];
+	    
+	    for (var k in task) {
+	    	t = t.replace('${' + k + '}', htmlEntities(task[k] || ''));
+	    }
+	    
+	    t = t.replace('${index}', '' + index);
 
-    data = data.toString();
-    for (var k in task) {
-      data = data.split('${' + k + '}').join(htmlEntities(task[k] || ''));
-    }
+	    for (var k in task) {
+	    	t += "<input type=hidden name='" + k + "__" + index + "' value=\"" + htmlEntities(task[k] || '') + "\" />";    	
+	    }
+	    
+	    out.push(t);
+	}
+	
+	out.push(template.tail);
 
-    ready_cb(null, data);
-  });
+    return out.join('');
 }
 
-function makeParser() {
-  return csvParse({columns: true, skip_empty_lines: true});
+function parseTasks(form) {
+	// var names are either numbered (suffix like __23) or simple. Simple ones will be applicable to all numbers in the array
+	var by_index = {};
+	var unindexed = {};
+	var num_tasks = 0;
+	
+	for (var k in form) {
+		var match = /(.+)__(\d+)/.exec(k);
+		console.log(k, match);
+		if (match) {
+			num_tasks = Math.max(num_tasks, 1+parseInt(match[2]));
+			by_index[match[2]] = by_index[match[2]] || {};
+			by_index[match[2]][match[1]] = form[k];
+		} else {
+			unindexed[k] = form[k];
+		}
+	}
+	
+	console.log(by_index, unindexed, num_tasks);
+	
+	var tasks = [];
+	for (var i = 0; i < num_tasks; i++) {
+		var task = {};
+		
+		for (var k in unindexed) {
+			task[k] = unindexed[k];
+		}
+		
+		var indexed = by_index['' + i] || {};
+		for (var k in indexed) {
+			task[k] = indexed[k];
+		}
+		
+		tasks.push(task);
+	}
+	
+	return tasks;
 }
 
-// Write a new completed task dictionary to the file.
-// TODO(danvk): preserve column ordering.
-function writeCompletedTask(task, completed_tasks_file, ready_cb) {
-  var old_headers = {}, new_headers = [];
-  for (var k in task) {
-    new_headers[k] = 1;
-  }
+createWorkflow(tasks_file, outputs_file, function(err, workflow) {
+	// --- begin server ---
+	var app = express();
+	app.use(bodyParser.urlencoded({extended: false}))
+	app.set('views', __dirname);
+	app.set("view options", {layout: false});
+	app.use(errorhandler({
+	    dumpExceptions:true,
+	    showStack:true
+	}));
+	if (static_dir) {
+	  app.use(express.static(path.resolve(static_dir)));
+	}
 
-  var parser = makeParser();
-  parser
-    .on('readable', function() {
-      var record;
-      while (record = parser.read()) {
-        for (var k in record) {
-          old_headers[k] = 1;
-        }
-      }
-    })
-    .on('finish', function() {
-      // Merge old & new headers.
-      var num_old_headers = 0;
-      for (var k in old_headers) {
-        num_old_headers++;
-        new_headers[k] = 1;
-      }
-      var ordered_cols = [];
-      for (var k in new_headers) {
-        ordered_cols.push(k);
-      }
-      ordered_cols.sort();
+	app.get("/", function(req, res) {
+		batch = workflow.nextBatch(batch_size);
+		if (batch.length === 0) {
+			res.send('DONE');
+			if (program.quit_on_done) {
+				process.exit(0);
+			}
+		} else {
+		      var out = "<!doctype html><html><body><form action=/submit method=post>\n";
+		      out += '<p>Completed: ' + workflow.finished.length + ' / ' + workflow.tasks.length + '</p>\n';
+			  out += renderTasks(template, batch);
+		      out += '<hr/><input type=submit />\n';
+		      out += "</form></body></html>\n";
 
-      var new_line = [];
-      for (var i = 0; i < ordered_cols.length; i++) {
-        var k = ordered_cols[i];
-        new_line.push(k in task ? task[k] : '');
-      }
+		      res.send(out);
+		}
+	});
+	
+	app.post("/submit", function(req, res) {
+		var tasks = parseTasks(req.body);
+		workflow.writeCompletedBatch(tasks, function(err) {
+		    if (err) {
+				console.log('ERROR:', err);
+				return res.send('ERROR, see console');
+			}
+		    console.log('Saved ' + JSON.stringify(tasks));
+			res.redirect('/');
+		});
+	});
 
-      var to_write = '';
-      if (num_old_headers == 0) {
-        to_write += quoteLine(ordered_cols);
-      }
-      to_write += '\n' + quoteLine(new_line);
-
-      fs.appendFile(completed_tasks_file, to_write, function(e) {
-        assert.ifError(e);
-        ready_cb();
-      });
-    });
-
-  fs.createReadStream(completed_tasks_file).pipe(parser);
-}
-
-if (!fs.existsSync(outputs_file)) {
-  fs.writeFileSync(outputs_file, '');
-}
-
-// --- begin server ---
-var app = express();
-app.use(bodyParser.urlencoded({extended: false}))
-app.set('views', __dirname);
-app.set("view options", {layout: false});
-app.use(errorhandler({
-    dumpExceptions:true,
-    showStack:true
-}));
-if (static_dir) {
-  app.use(express.static(path.resolve(static_dir)));
-}
-
-app.get("/", function(req, res) {
-  getNextTask(function(task, finished_tasks, num_tasks) {
-    renderTemplate(template_file, task, function(e, data) {
-      var out = "<!doctype html><html><body><form action=/submit method=post>\n";
-      out += '<p>' + finished_tasks + ' / ' + num_tasks + '</p>\n';
-      for (var k in task) {
-        out += "<input type=hidden name='" + k + "' value=\"" + htmlEntities(task[k] || '') + "\" />";
-      }
-      out += data;
-      out += '<hr/><input type=submit />\n';
-      out += "</form></body></html>\n";
-
-      res.send(out);
-    });
-  }, function() {
-    res.send('DONE');
-    if (program.quit_on_done) {
-      process.exit(0);
-    }
-  });
+	app.listen(port);
+	console.log('Running local turk on http://localhost:' + port)
+	open('http://localhost:' + port + '/');
 });
-
-app.post("/submit", function(req, res) {
-  var task = req.body;
-  writeCompletedTask(task, outputs_file, function(e) {
-    if (e) {
-      res.send('FAIL: ' + JSON.stringify(e));
-    } else {
-      console.log('Saved ' + JSON.stringify(task));
-      res.redirect('/');
-    }
-  });
-});
-
-app.listen(port);
-console.log('Running local turk on http://localhost:' + port)
-open('http://localhost:' + port + '/');

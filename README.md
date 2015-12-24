@@ -73,3 +73,20 @@ This will bring up a web server with a UI for assigning one of those two labels
 to each image on your local file system. The results will go in `output.csv`.
 
 For more details, run `classify-images --help`.
+
+Batching
+--------
+
+It is often desirable to represent several records on a page, and submit them all when done. Localturk supports this mode with an optional `--batch_size` switch.
+
+First, you should define repeatable template by adding the following marker before and after the repeatable block:
+```html
+<!-- localturk-repeat -->
+```
+Inside repeatable block you can use a special meta name `${index}` that will take the value of the task index within the batch (rarely needed).
+
+If `localturk-repeat` marker is not found, the whole template will be repeated.
+
+Finally, you need to start `localturk` giving it `--batch_size` parameter of `2` or greater.
+
+See example of batching in `sample_batch/` directory.
